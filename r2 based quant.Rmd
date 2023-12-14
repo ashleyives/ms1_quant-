@@ -1,0 +1,461 @@
+---
+title: "R2-based quant runner"
+author: "Henrique Seckler"
+date: "July 3, 2020"
+output: html_document
+---
+
+# Convert data to mzXML
+
+```{r}
+
+folder <- "X:/Projects/2016 Seckler - ApoA1/For_Ashley/ETD" # the folder containing raw data
+setwd(folder)
+
+Wizard_path <- "C:/Program Files/ProteoWizard/ProteoWizard 3.0.20057.350faab3b/msconvert.exe" # path to msconverter
+
+raw.path <- list.files(pattern = ".raw$") # grab all raw files
+
+for(o in 1:length(raw.path)){
+system(paste("\"", Wizard_path, "\" --mzXML --ignoreUnknownInstrumentError --simAsSpectra \"", folder, "/", raw.path[o], "\" -o \"", folder, "\"", sep=""))} # converts and drops them in the same folder (your computer needs to have access to that folder, otherwise change the path after "-o")
+
+
+```
+
+1 - alter the spreadsheet "aminoacids_w_mods.csv" with any new modificationa
+
+#PFR sequence to formula
+
+```{r}
+library(readr)
+library(dplyr)
+
+folder <- "X:/Projects/2016 Seckler - ApoA1/For_Porco" # the folder containing raw data
+setwd(folder)
+file <- "sequences.csv"
+
+aminoacids_mods <- read_csv(list.files(pattern = "aminoacids_w_mods.csv"))
+atoms <- read_csv(list.files(pattern = "atoms.csv"))
+csv <- read_csv(list.files(pattern = file))
+
+formulas<-c()
+masses <- c()
+names_charges_and_time <- c()
+for(i in 1:length(csv$Sequence)){ # transforms sequences in formulas and masses based on aminoacids and atoms table
+  print(i)
+  seq <- csv$Sequence[i]
+ 
+  if(is.na(seq)){
+    formulas<- rbind(formulas, cbind(Sequence = " ", formula = " "))
+    masses <- rbind(masses, " ")
+    names <- rbind(names, " ")}
+  else{
+    seq.2 <- unlist(strsplit(seq, ""))
+   
+    p <- 0
+    seq.3 <-c()
+    for(o in 1:length(seq.2)){
+      if(seq.2[o] == "["){
+        seq.3 <- c(seq.3, paste(seq.2[o:min(grep("]", seq.2)[grep("]", seq.2) > o])], collapse=""))
+        p <- min(grep("]", seq.2)[grep("]", seq.2) > o])
+      }
+      else{
+        if(o > p){
+          seq.3 <- c(seq.3, seq.2[o])
+        }
+      }
+    }
+   
+    for(o in atoms$Element){
+      assign(paste(o, "s"), 0)
+    }
+   
+    for(o in seq.3){
+        aminoacid <- aminoacids_mods$Formula[which(aminoacids_mods$Abbreviation == o)]
+        for(a in atoms$Element){
+          if(length(grep(a, aminoacid)) > 0){
+            n <- substr(aminoacid, unlist(gregexpr(a, aminoacid)) + nchar(a), nchar(aminoacid))
+            if(substr(n,1,1) %in% LETTERS|n == ""){
+              assign(paste(a, "s"), get(paste(a, "s")) + 1)
+              }else{
+                d=1
+                while(!is.na(as.numeric(substr(n,1,d))) & d <= nchar(n)|substr(n,1,d)=="-"){
+                  d=d+1
+                  }
+                assign(paste(a, "s"), get(paste(a, "s")) + as.numeric(substr(n,1,d-1)))
+              }
+            }
+        }
+        if(o %in% LETTERS){
+        assign(paste("O", "s"), get(paste("O", "s")) - 1)
+        assign(paste("H", "s"), get(paste("H", "s")) - 2)
+        }
+    }
+   
+    assign(paste("O", "s"), get(paste("O", "s")) + 1)
+    assign(paste("H", "s"), get(paste("H", "s")) + 2)
+   
+    form.tabl <- c()
+    mass <- 0
+    for(o in atoms$Element){
+      form.tabl <- rbind(form.tabl, cbind(o, get(paste(o, "s"))))
+      mass <- mass + get(paste(o, "s")) * atoms[atoms$Element == o,2]
+    }
+   
+form.tabl <- form.tabl[!form.tabl[,2] == 0,]
+
+written <- c()
+for(s in 1:nrow(form.tabl)){
+  written <- c(written, form.tabl[s,1], form.tabl[s,2])
+}
+
+formulas<- rbind(formulas, cbind(Sequence = csv$Sequence[i], formula = paste(written, collapse = "")))
+masses <- rbind(masses, mass)
+names_charges_and_time <- rbind(names_charges_and_time, csv[i,c("Name", "Min Charge", "Max Charge", "Min RT", "Max RT")])
+}
+}
+
+formulas <- as.data.frame(formulas)
+formulas <- cbind(formulas, Mass = masses)
+formulas <- cbind(formulas, names_charges_and_time)
+
+write.table(formulas, "formulas_output.csv", sep =",", row.names = F)
+
+```
+
+# Quantification
+
+```{r}
+# Packages
+library(DescTools)
+library(ggplot2)
+library(mzR)
+library(readr)
+library(dplyr)
+library(zoo)
+library(taRifx)
+library(enviPat)
+library(parallel)
+data("isotopes")
+
+# Custom Functions
+  noneg <- function(x){if(x < 0){return(0)}else{return(x)}} # transforms negative numbers in 0
+
+# Find Paths and Tables
+
+  folder <- "X:/Projects/2016 Seckler - ApoA1/For_Porco" # the folder containing raw data
+  setwd(folder) # set working directory
+  path.mzxml <- list.files(pattern="*.mzXML$") # Grab all mzXML
+  Formulas <- read_csv("formulas_output.csv")
+
+# For paralell computing
+ 
+  numCores <- detectCores() # detects computer cores
+  cl <- makeCluster(numCores) # make core cluster
+  clusterEvalQ(cl, { library(zoo)}) # add library to core
+
+# Choose parameters
+ 
+  roll_wind <- 5 # number of scans to average in a rolling window
+  which_scan_types <- "ms1" # "ms1" or "ms2" (for more specific scan choices alter code)
+  resol <- 120000 # expected resolution of the data
+  mass_acc_tolerance <- 20 # choose mass accuracy tolerance (script opens a window double that size)
+  noise_size <- 2 # choose size of the window used for noise calculation
+  score_min <- 0.5 # choose the minimum pearson's r to call an isotopic match good
+  peak_density <- 200 #number of peaks per 1th
+
+# Main loop  
+ 
+mastertable <- c() # Empty table for data loading
+for(i in 1:length(path.mzxml)){ # File layer
+ 
+  # beginning ####
+  print(paste(i, "of", length(path.mzxml))) # Keep track of i
+  RAW <- openMSfile(path.mzxml[i]) # open raw file
+  PFRs <- Formulas$Name # find PFR names
+  raw_header <- header(RAW) # Extract scan headers from MZ ramp
+ 
+  if(which_scan_types == "ms1"){
+  good.scans <- filter(raw_header, is.na(precursorMZ))$seqNum
+  if(length(good.scans) == 0){
+    good.scans <- filter(raw_header, precursorMZ == 0)$seqNum
+  }
+  }# Select scans
+ 
+  if(which_scan_types == "ms2"){
+  good.scans <- filter(raw_header, !is.na(precursorMZ))$seqNum}# Select scans
+
+  raw_header2 <- filter(raw_header, seqNum %in% good.scans) #create header of just good scans
+  peaknums <- raw_header2$peaksCount # extract number of peaks per scan
+  peaklist <- peaks(RAW, scans = good.scans) # extract a list of MZs and intensities
+  peaktable <- do.call("rbind", peaklist) # transform list in table
+  scannum <- rep.int(good.scans, peaknums) # Find scan numbers
+  RT <- rep.int(raw_header2$retentionTime/60, peaknums) # Find retention times of scans
+  peaktable <- cbind(mz = peaktable[,1], int = peaktable[,2], scannum, RT) # add a "scan number" column to table
+  peaktable <- as.data.frame(peaktable) # transform table in class dataframe
+  #####
+ 
+  for(z in 1:length(PFRs)){ # PFR layer
+   
+    print(paste("PFR =", PFRs[z]))
+   
+    isopatterns <- isopattern(isotopes, Formulas[z,"formula"]) # calculate isotpic patterns
+    envelope_tot <-  envelope(isopatterns, ppm = FALSE, dmz = "get", frac = 1/4, env = "Gaussian", resolution = resol, plotit = F, verbose = TRUE) # calculate isotpic envelope
+   
+    envelope_tot[[1]][,2] <- (envelope_tot[[1]][,2]/max(envelope_tot[[1]][,2])) # normalized to max expected isotopomer
+    envelope_tot.1 <- envelope_tot[[1]]
+
+    scored_sum <- c()
+    full_sum <-c()
+    for(p in Formulas$`Min Charge`[z]:Formulas$`Max Charge`[z]){ # Charge state layer
+     
+    envelope_tot <- envelope_tot.1
+     
+    envelope_tot[,1] <- c((envelope_tot[,1] + p*1.00727)/p) # isotopic distribution to m/z
+    mz.mid <- envelope_tot[,1][which.max(envelope_tot[,2])] # find m/z of highest isotopomer
+    envelope_tot <- as.data.frame(envelope_tot) # transform in dataframe
+   
+    n <- 0.1
+    perc <- 0
+    while(perc < 0.95){ # find m/z space that includes 95% of expected intensity
+      tp <- envelope_tot[envelope_tot[,1] < (mz.mid + n),]
+      tp <- tp[tp[,1] > (mz.mid - n),]
+      perc <- sum(tp[,2])/sum(envelope_tot[,2])
+      n = n+0.01
+    }
+    mz1 <- mz.mid - n # minimum m/z for extracted ion chromatogram
+    mz2 <- mz.mid + n # maximum m/z for extracted ion chromatogram
+   
+    peaktable.filtered <- filter(peaktable, mz > mz1 - noise_size, mz < mz2 + noise_size, RT > Formulas$`Min RT`[z], RT < Formulas$`Max RT`[z]) # filter peaktable to make extracted ion chromatogram
+    envelope_tot <- filter(envelope_tot, `m/z` > mz1, `m/z` < mz2) # filter envelope to grab just 95 percentile
+   
+    seq_mzs <- seq(min(peaktable.filtered$mz), max(peaktable.filtered$mz), (max(peaktable.filtered$mz) - min(peaktable.filtered$mz))/((max(peaktable.filtered$mz) - min(peaktable.filtered$mz))*peak_density)) # make a sequence of m/zs for averaging
+   
+    temp_2 <- filter(peaktable.filtered, scannum == peaktable.filtered$scannum[1]) # just first scan
+    trapz <- function(x){
+       if(length(temp_2$mz[temp_2$mz < x]) > 0 & length(temp_2$mz[temp_2$mz > x]) > 0){
+                   
+          maxim <- min(temp_2$mz[temp_2$mz > x])
+          minim <- max(temp_2$mz[temp_2$mz < x])
+             
+          maxim.int <- temp_2$int[temp_2$mz == maxim]
+          minim.int <- temp_2$int[temp_2$mz == minim]
+             
+          return(((abs(maxim.int-minim.int)*(maxim-x))/(maxim-minim))+maxim.int)}else{return(0)
+     }
+    }# make an extrapolation function
+   
+    same_basis <- c()
+    for(o in unique(peaktable.filtered$scannum)){
+    temp_2 <- filter(peaktable.filtered, scannum == o)
+    clusterExport(cl, "temp_2")
+   
+    same_basis <- rbind(same_basis, cbind(parSapply(cl, seq_mzs,trapz), mz = seq_mzs, scannum = o, RT = unique(temp_2$RT)))
+     }# make all scans the same m/z basis        
+   
+    average.1 <- function(x){
+    return(cbind(RT = rollmean(same_basis[,4][same_basis[,2] == x], roll_wind), int = rollmean(same_basis[,1][same_basis[,2] == x], roll_wind), mz = x))
+    }# make a scan averaging function
+
+    clusterExport(cl, "same_basis") #export objects to cluster
+    clusterExport(cl, "roll_wind") #export objects to cluster
+ 
+    avgd <- parLapply(cl, seq_mzs, average.1) #create scan average list
+    avgd <- do.call("rbind", avgd) #transform in table
+    avgd <- as.data.frame(avgd) #transform in dataframe
+   
+    for_noise <- filter(avgd, !mz %in% filter(avgd, mz > mz1, mz < mz2)$mz)
+   
+    noise <- c()
+    for(o in unique(for_noise$RT)){ # calculate noise as the median of each scan
+      if(length(for_noise$int[for_noise$RT == o]) > 10){
+      noise <- rbind(noise, cbind(mean(for_noise$int[for_noise$RT == o]), o))
+      }}
+   
+    avgd <- filter(avgd, mz > mz1, mz < mz2)
+    aggregated.sum <- aggregate(avgd, list(avgd$RT), sum)
+    aggregated.num <- aggregate(avgd, list(avgd$RT), length)
+ 
+   
+    aggregated.sum <- filter(aggregated.sum, Group.1 %in% noise[,2])
+    aggregated.num <- filter(aggregated.num, Group.1 %in% noise[,2])
+    noise <- noise[noise[,2] %in% aggregated.sum$Group.1,]
+   
+    aggregated.sum <- mutate(aggregated.sum, int_no_noise = sapply(aggregated.sum$int - (noise[,1]*aggregated.num$mz), noneg))
+   
+    Score <- c()
+    for(e in aggregated.sum$Group.1[aggregated.sum$int_no_noise > 0]){
+     
+      temp_3 <- avgd[avgd$RT == e,]
+   
+      envelope_tot_df <- mutate(envelope_tot, adjint = envelope_tot$abundance/max(envelope_tot$abundance)*(max(temp_3$int))) # normalized to max observed isotopomer
+      cal2 <- (temp_3$mz[temp_3$int == max(filter(temp_3, mz > mz.mid - mass_acc_tolerance*mz.mid/1E6, mz < mz.mid + mass_acc_tolerance*mz.mid/1E6)$int)] - mz.mid)/mz.mid * 1E6
+     
+      if(!length(cal2) == 1){cal2 <- 0}
+
+      envelope_tot_df$`m/z` <- envelope_tot_df$`m/z` + cal2*(envelope_tot_df$`m/z`/1e6)
+
+      exp <- c()
+            for(m in temp_3$mz){
+             
+              if(length(envelope_tot_df$`m/z`[envelope_tot_df$`m/z` < m]) > 0 & length(envelope_tot_df$`m/z`[envelope_tot_df$`m/z` > m]) > 0){
+              maxim <- min(envelope_tot_df$`m/z`[envelope_tot_df$`m/z` > m])
+              minim <- max(envelope_tot_df$`m/z`[envelope_tot_df$`m/z` < m])
+             
+              maxim.int <- envelope_tot_df$adjint[envelope_tot_df$`m/z` == maxim]
+              minim.int <- envelope_tot_df$adjint[envelope_tot_df$`m/z` == minim]
+             
+             
+              exp <- c( exp, ((abs(maxim.int-minim.int)*(maxim-m))/(maxim-minim))+maxim.int)}else{
+                exp <- c(exp,0)
+              }
+             
+            }
+   
+    Score <- c(Score, cor(exp, temp_3$int))
+    }    
+   
+    if(any(Score > score_min)){
+    scored_sum <- rbind(scored_sum, cbind(aggregated.sum[aggregated.sum$Group.1 %in% aggregated.sum$Group.1[aggregated.sum$int_no_noise > 0][Score > score_min],], charge = p))}else{print(paste("no score larger than", score_min, "for charge =", p))}
+   
+    full_sum <- rbind(full_sum, cbind(aggregated.sum, charge = p))
+   
+    }
+   
+    if(!is.null(scored_sum)){
+   
+    aggregated_scored <- aggregate(scored_sum, list(scored_sum$Group.1), sum)
+    aggregated_full <- aggregate(full_sum, list(full_sum$Group.1), sum)
+   
+    RTmax <- aggregated_scored[which.max(aggregated_scored$int_no_noise),1]
+    charge_max <- scored_sum[scored_sum$Group.1 == RTmax,"charge"][which.max(scored_sum[scored_sum$Group.1 == RTmax,"int_no_noise"])]
+   
+    # for best scan #####
+   
+    p = charge_max
+    e = RTmax
+   
+    envelope_tot <- envelope_tot.1
+     
+    envelope_tot[,1] <- c((envelope_tot[,1] + p*1.00727)/p) # isotopic distribution to m/z
+    mz.mid <- envelope_tot[,1][which.max(envelope_tot[,2])] # find m/z of highest isotopomer
+    envelope_tot <- as.data.frame(envelope_tot) # transform in dataframe
+   
+    n <- 0.1
+    perc <- 0
+    while(perc < 0.95){ # find m/z space that includes 95% of expected intensity
+      tp <- envelope_tot[envelope_tot[,1] < (mz.mid + n),]
+      tp <- tp[tp[,1] > (mz.mid - n),]
+      perc <- sum(tp[,2])/sum(envelope_tot[,2])
+      n = n+0.01
+    }
+    mz1 <- mz.mid - n # minimum m/z for extracted ion chromatogram
+    mz2 <- mz.mid + n # maximum m/z for extracted ion chromatogram
+   
+    peaktable.filtered <- filter(peaktable, mz > mz1 - noise_size, mz < mz2 + noise_size, RT > Formulas$`Min RT`[z], RT < Formulas$`Max RT`[z]) # filter peaktable to make extracted ion chromatogram
+    envelope_tot <- filter(envelope_tot, `m/z` > mz1, `m/z` < mz2) # filter envelope to grab just 95 percentile
+   
+    seq_mzs <- seq(min(peaktable.filtered$mz), max(peaktable.filtered$mz), (max(peaktable.filtered$mz) - min(peaktable.filtered$mz))/((max(peaktable.filtered$mz) - min(peaktable.filtered$mz))*peak_density)) # make a sequence of m/zs for averaging
+ 
+    temp_2 <- filter(peaktable.filtered, scannum == peaktable.filtered$scannum[1]) # just first scan
+    trapz <- function(x){
+       if(length(temp_2$mz[temp_2$mz < x]) > 0 & length(temp_2$mz[temp_2$mz > x]) > 0){
+                   
+          maxim <- min(temp_2$mz[temp_2$mz > x])
+          minim <- max(temp_2$mz[temp_2$mz < x])
+             
+          maxim.int <- temp_2$int[temp_2$mz == maxim]
+          minim.int <- temp_2$int[temp_2$mz == minim]
+             
+          return(((abs(maxim.int-minim.int)*(maxim-x))/(maxim-minim))+maxim.int)}else{return(0)
+     }
+    }# make an extrapolation function
+   
+    same_basis <- c()
+    for(o in unique(peaktable.filtered$scannum)){
+    temp_2 <- filter(peaktable.filtered, scannum == o)
+    clusterExport(cl, "temp_2")
+   
+    same_basis <- rbind(same_basis, cbind(parSapply(cl, seq_mzs,trapz), mz = seq_mzs, scannum = o, RT = unique(temp_2$RT)))
+     }# make all scans the same m/z basis        
+   
+    average.1 <- function(x){
+    return(cbind(RT = rollmean(same_basis[,4][same_basis[,2] == x], roll_wind), int = rollmean(same_basis[,1][same_basis[,2] == x], roll_wind), mz = x))
+    }# make a scan averaging function
+
+    clusterExport(cl, "same_basis") #export objects to cluster
+    clusterExport(cl, "roll_wind") #export objects to cluster
+ 
+    avgd <- parLapply(cl, seq_mzs, average.1) #create scan average list
+    avgd <- do.call("rbind", avgd) #transform in table
+    avgd <- as.data.frame(avgd) #transform in dataframe
+   
+    for_noise <- filter(avgd, !mz %in% filter(avgd, mz > mz1, mz < mz2)$mz)
+   
+    noise <- c()
+    for(o in unique(for_noise$RT)){ # calculate noise as the median of each scan
+      if(length(for_noise$int[for_noise$RT == o]) > 10){
+      noise <- rbind(noise, cbind(mean(for_noise$int[for_noise$RT == o]), o))
+      }}
+   
+    avgd <- filter(avgd, mz > mz1, mz < mz2)
+    aggregated.sum <- aggregate(avgd, list(avgd$RT), sum)
+    aggregated.num <- aggregate(avgd, list(avgd$RT), length)
+ 
+   
+    aggregated.sum <- filter(aggregated.sum, Group.1 %in% noise[,2])
+    aggregated.num <- filter(aggregated.num, Group.1 %in% noise[,2])
+    noise <- noise[noise[,2] %in% aggregated.sum$Group.1,]
+   
+    aggregated.sum <- mutate(aggregated.sum, int_no_noise = sapply(aggregated.sum$int - (noise[,1]*aggregated.num$mz), noneg))
+   
+      temp_3 <- avgd[avgd$RT == e,]
+   
+      envelope_tot_df <- mutate(envelope_tot, adjint = envelope_tot$abundance/max(envelope_tot$abundance)*(max(temp_3$int))) # normalized to max observed isotopomer
+      cal2 <- (temp_3$mz[temp_3$int == max(filter(temp_3, mz > mz.mid - mass_acc_tolerance*mz.mid/1E6, mz < mz.mid + mass_acc_tolerance*mz.mid/1E6)$int)] - mz.mid)/mz.mid * 1E6
+     
+      if(length(cal2) == 0){cal2 <- 0}
+
+      envelope_tot_df$`m/z` <- envelope_tot_df$`m/z` + cal2*(envelope_tot_df$`m/z`/1e6)
+
+      exp <- c()
+            for(m in temp_3$mz){
+             
+              if(length(envelope_tot_df$`m/z`[envelope_tot_df$`m/z` < m]) > 0 & length(envelope_tot_df$`m/z`[envelope_tot_df$`m/z` > m]) > 0){
+              maxim <- min(envelope_tot_df$`m/z`[envelope_tot_df$`m/z` > m])
+              minim <- max(envelope_tot_df$`m/z`[envelope_tot_df$`m/z` < m])
+             
+              maxim.int <- envelope_tot_df$adjint[envelope_tot_df$`m/z` == maxim]
+              minim.int <- envelope_tot_df$adjint[envelope_tot_df$`m/z` == minim]
+             
+             
+              exp <- c( exp, ((abs(maxim.int-minim.int)*(maxim-m))/(maxim-minim))+maxim.int)}else{
+                exp <- c(exp,0)
+              }
+             
+            }
+   
+    Score <- cor(exp, temp_3$int)
+    #####
+   
+    # plots_fitter #####
+   
+    P <- ggplot() + geom_area(aes(temp_3$mz, exp), fill = "pink", color = "red", size = 1) + geom_path(aes(temp_3$mz, temp_3$int), size = 0.7) +  geom_hline(aes(yintercept = noise[,1][noise[,2] == e]), color = "green") +  geom_hline(aes(yintercept = 0), color = "black") + geom_text(aes(x = mean(c(mz1, mz2)), y = max(temp_3$int) * 1.1, label = paste("z =", p, ", FitScore =", round(Score,2))), size =4) + scale_y_continuous(limits = c(0,NA)) + theme(plot.background = element_rect(color = "black"), panel.background = element_blank()) + xlab("m/z") + ylab("int")
+   
+    ggplot() + geom_vline(aes(xintercept = RTmax), color = "blue") + geom_path(aes(scored_sum$Group.1, scored_sum$int_no_noise, color = as.factor(scored_sum$charge)), size = 1.5) + geom_path(aes(full_sum$Group.1, full_sum$int_no_noise, color = as.factor(full_sum$charge)), size = 0.5) + labs(color = "Charge") + xlab("RT (min)") + ylab("Background-subtracted Intensity") + scale_y_continuous(limits = c(0,max(full_sum$int_no_noise) * 2)) + annotation_custom(ggplotGrob(P), xmin = mean(full_sum$Group.1), xmax = max(full_sum$Group.1), ymin = max(full_sum$int_no_noise)*1.1, ymax = max(full_sum$int_no_noise) * 2)
+    ggsave(paste(path.mzxml[i], PFRs[z], "charge_states.jpg", sep="_"), dpi =600)
+   
+    ggplot() + geom_vline(aes(xintercept = RTmax), color = "blue") + geom_path(aes(aggregated_scored$Group.1, aggregated_scored$int_no_noise), size = 1.5) + geom_path(aes(aggregated_full$Group.1, aggregated_full$int_no_noise), size = 0.5) + xlab("RT (min)") + ylab("Background-subtracted Intensity") + scale_y_continuous(limits = c(0,max(aggregated_full$int_no_noise) * 2)) + annotation_custom(ggplotGrob(P), xmin = mean(aggregated_full$Group.1), xmax = max(aggregated_full$Group.1), ymin = max(aggregated_full$int_no_noise)*1.1, ymax = max(aggregated_full$int_no_noise) * 2)
+    ggsave(paste(path.mzxml[i], PFRs[z], "total intensity.jpg", sep="_"), dpi =600)
+    #####
+   
+    # add to table ####
+   
+    mastertable <- rbind(mastertable, cbind(file = path.mzxml[i], PFR = PFRs[z], AUC = AUC(aggregated_scored$Group.1, aggregated_scored$int_no_noise)))
+    }else{print("no high-scored signal for this PFR")
+    mastertable <- rbind(mastertable, cbind(file = path.mzxml[i], PFR = PFRs[z], AUC = NA))}
+  }}
+
+
+write.table(mastertable, "mastertable.csv", sep = ",", row.names = F)
+```
